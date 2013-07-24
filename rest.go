@@ -14,25 +14,35 @@ import (
 	"sync"
 
 	pathpkg "path"
+
+	"kylelemons.net/go/esource"
 )
 
 type Object struct {
 	path   string
 	name   string
-	root   reflect.Value
 	parent *Object
 	child  map[string]*Object
 
+	root reflect.Value
+	typ  reflect.Type
+	kind reflect.Kind
+
 	rw sync.RWMutex
+
+	ESource *esource.EventSource
 }
 
 func NewObject(obj interface{}) *Object {
-	return newObject(nil, reflect.ValueOf(obj), nil)
+	es := esource.New()
+	return newObject([]string{""}, reflect.ValueOf(obj), nil, es)
 }
 
-func newObject(path []string, val reflect.Value, parent *Object) *Object {
+func newObject(path []string, val reflect.Value, parent *Object, es *esource.EventSource) *Object {
+	typ, kind := val.Type(), val.Kind()
+
 	if len(path) > 10 {
-		return nil
+		panic("DEBUG: depth limit exceeded")
 	}
 
 	sub := func(id string) []string {
@@ -40,10 +50,13 @@ func newObject(path []string, val reflect.Value, parent *Object) *Object {
 	}
 
 	obj := &Object{
-		path:   "/" + pathpkg.Join(path...),
-		root:   val,
-		parent: parent,
-		child:  map[string]*Object{},
+		path:    "/" + pathpkg.Join(path...),
+		parent:  parent,
+		child:   map[string]*Object{},
+		root:    val,
+		typ:     typ,
+		kind:    kind,
+		ESource: es,
 	}
 	if len(path) > 0 {
 		obj.name = path[len(path)-1]
@@ -56,20 +69,20 @@ func newObject(path []string, val reflect.Value, parent *Object) *Object {
 		panic(fmt.Sprintf("can't call Interface on object at %s", obj.path))
 	}
 
-	typ, kind := val.Type(), val.Kind()
 	switch kind {
 	case reflect.Ptr, reflect.Interface:
 		if val.IsNil() {
 			break
 		}
-		return newObject(path, val.Elem(), obj)
+		sub := newObject(path, val.Elem(), obj, es)
+		obj.child = sub.child
 	case reflect.Struct:
 		for i := 0; i < typ.NumField(); i++ {
 			field := typ.Field(i)
 			if field.PkgPath != "" {
 				continue // skip unexported fields
 			}
-			obj.child[field.Name] = newObject(sub(field.Name), val.Field(i), obj)
+			obj.child[field.Name] = newObject(sub(field.Name), val.Field(i), obj, es)
 		}
 	case reflect.Map:
 		for _, keyVal := range val.MapKeys() {
@@ -84,18 +97,51 @@ func newObject(path []string, val reflect.Value, parent *Object) *Object {
 				key = fmt.Sprintf("%v", keyVal.Interface())
 			}
 			item := val.MapIndex(keyVal)
-			obj.child[key] = newObject(sub(key), item, obj)
+			obj.child[key] = newObject(sub(key), item, obj, es)
 		}
 	case reflect.Array, reflect.Slice:
 		for i := 0; i < val.Len(); i++ {
 			item := val.Index(i)
 			key := fmt.Sprintf("%d", i)
-			obj.child[key] = newObject(sub(key), item, obj)
+			obj.child[key] = newObject(sub(key), item, obj, es)
 		}
 	case reflect.Chan, reflect.Func, reflect.UnsafePointer:
 		panic(fmt.Sprintf("can't handle %s in object at %s", kind, obj.path))
 	}
 	return obj
+}
+
+var (
+	stringType = reflect.TypeOf("")
+)
+
+func (obj *Object) set(v reflect.Value) error {
+	parent := obj.parent
+	if parent == nil {
+		return fmt.Errorf("cannot set object with no parent")
+	}
+
+	switch parent.kind {
+	case reflect.Map:
+		var key reflect.Value
+		switch ktyp := parent.typ.Key(); ktyp {
+		case stringType:
+			key = reflect.ValueOf(obj.name)
+		default:
+			// TODO(kevlar): technically we can convert to any type to which string is convertable
+			return fmt.Errorf("cannot set key of non-string map type %s", parent.typ)
+		}
+		parent.root.SetMapIndex(key, v)
+	default:
+		if !obj.root.CanSet() {
+			return fmt.Errorf("cannot set a %s", obj.typ)
+		}
+		obj.root.Set(v)
+	}
+
+	path := strings.Split(obj.path, "/")
+	parent.child[obj.name] = newObject(path, v, parent, obj.ESource)
+	return nil
 }
 
 func Handle(path string, obj *Object) {
@@ -208,7 +254,18 @@ func (obj *Object) Get(w io.Writer, headers http.Header, r *http.Request) (int, 
 }
 
 func (obj *Object) Post(w io.Writer, headers http.Header, r *http.Request) (int, error) {
-	return http.StatusNotImplemented, nil
+	zptr := reflect.New(obj.typ)
+	if err := json.NewDecoder(r.Body).Decode(zptr.Interface()); err != nil {
+		return http.StatusBadRequest, fmt.Errorf("failed to decode body as JSON: %s", err)
+	}
+	if err := obj.set(zptr.Elem()); err != nil {
+		return http.StatusBadRequest, err
+	}
+	obj.ESource.Events <- esource.Event{
+		Type: "post",
+		Data: obj.path,
+	}
+	return http.StatusNoContent, nil
 }
 
 func (obj *Object) Put(w io.Writer, headers http.Header, r *http.Request) (int, error) {

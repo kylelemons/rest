@@ -2,9 +2,11 @@ package rest
 
 import (
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/kylelemons/godebug/diff"
@@ -14,6 +16,7 @@ func TestRequest(t *testing.T) {
 	type test struct {
 		method string
 		path   string
+		body   string
 		code   int
 		ctype  string
 		output string
@@ -55,6 +58,22 @@ func TestRequest(t *testing.T) {
 				code:   http.StatusNotFound,
 				ctype:  "text/plain;charset=utf-8",
 				output: "/foo/0\n/foo/1\n",
+			}, {
+				method: "POST",
+				path:   "/foo",
+				body:   `{"k":["v0","v1"]}`,
+				code:   http.StatusNoContent,
+			}, {
+				method: "POST",
+				path:   "/foo/k/0",
+				body:   `"v2"`,
+				code:   http.StatusNoContent,
+			}, {
+				method: "GET",
+				path:   "/foo",
+				code:   http.StatusOK,
+				ctype:  "application/json;charset=utf-8",
+				output: `{"k":["v2","v1"]}` + "\n",
 			}},
 		},
 		{
@@ -113,6 +132,7 @@ func TestRequest(t *testing.T) {
 				URL: &url.URL{
 					Path: test.path,
 				},
+				Body: ioutil.NopCloser(strings.NewReader(test.body)),
 			}
 			obj.ServeHTTP(rec, req)
 			if got, want := rec.Code, test.code; got != want {
@@ -133,5 +153,16 @@ func TestRequest(t *testing.T) {
 				t.Errorf("%s: body mismatch:\n%s", desc, diff.Diff(got, want))
 			}
 		}
+
+		// Print out the events we got
+		old, events := obj.ESource.Tee(0)
+		obj.ESource.Close()
+		for _, event := range old {
+			t.Logf("%s: event: %+v", group.desc, event)
+		}
+		for event := range events {
+			t.Logf("%s: event: %+v", group.desc, event)
+		}
+		// TODO(kevlar): test these?
 	}
 }
