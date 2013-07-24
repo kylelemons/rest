@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -36,7 +37,7 @@ func newObject(path []string, val reflect.Value, parent *Object) *Object {
 	}
 
 	obj := &Object{
-		path:   "/" + strings.Join(path, "/"),
+		path:   "/" + pathpkg.Join(path...),
 		root:   val,
 		parent: parent,
 		child:  map[string]*Object{},
@@ -101,15 +102,23 @@ func Handle(path string, obj *Object) {
 
 func (obj *Object) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	pieces := strings.Split(r.URL.Path, "/")
-	for i := 0; i < len(pieces); i++ {
+	for i := 1; i < len(pieces); i++ {
 		name := pieces[i]
-		if name == "" && (i == 0 || i == len(pieces)-1) {
+		if name == "" && i == len(pieces)-1 {
 			continue
 		}
 		sub, ok := obj.child[name]
 		if !ok {
-			// TODO(kevlar): index
-			http.NotFound(w, r)
+			w.Header().Set("Content-Type", "text/plain;charset=utf-8")
+			w.WriteHeader(http.StatusNotFound)
+			keys := make([]string, 0, len(obj.child))
+			for key := range obj.child {
+				keys = append(keys, pathpkg.Join(obj.path, key))
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				fmt.Fprintln(w, key)
+			}
 			return
 		}
 		obj = sub

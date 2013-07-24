@@ -49,6 +49,12 @@ func TestRequest(t *testing.T) {
 				code:   http.StatusOK,
 				ctype:  "application/json;charset=utf-8",
 				output: `"baz"` + "\n",
+			}, {
+				method: "GET",
+				path:   "/foo/index",
+				code:   http.StatusNotFound,
+				ctype:  "text/plain;charset=utf-8",
+				output: "/foo/0\n/foo/1\n",
 			}},
 		},
 		{
@@ -77,6 +83,18 @@ func TestRequest(t *testing.T) {
 				output: `"/some/path"` + "\n",
 			}, {
 				method: "GET",
+				path:   "/URL/*",
+				code:   http.StatusNotFound,
+				ctype:  "text/plain;charset=utf-8",
+				output: `/URL/Fragment
+/URL/Host
+/URL/Opaque
+/URL/Path
+/URL/RawQuery
+/URL/Scheme
+/URL/User` + "\n",
+			}, {
+				method: "GET",
 				path:   "/Header/Key/0",
 				code:   http.StatusOK,
 				ctype:  "application/json;charset=utf-8",
@@ -89,7 +107,6 @@ func TestRequest(t *testing.T) {
 		obj := NewObject(group.input)
 		for idx, test := range group.tests {
 			desc := fmt.Sprintf("%s: %d. %s(%q)", group.desc, idx, test.method, test.path)
-
 			rec := httptest.NewRecorder()
 			req := &http.Request{
 				Method: test.method,
@@ -102,7 +119,12 @@ func TestRequest(t *testing.T) {
 				t.Errorf("%s: code = %v, want %v", desc, got, want)
 			}
 			if got := rec.HeaderMap.Get("Content-Length"); got == "" {
-				t.Errorf("%s: no Content-Length header", desc)
+				switch rec.Code {
+				case http.StatusNotFound:
+					// we don't care for errors
+				default:
+					t.Errorf("%s: no Content-Length header after %d %s", desc, rec.Code, http.StatusText(rec.Code))
+				}
 			}
 			if got, want := rec.HeaderMap.Get("Content-Type"), test.ctype; got != want {
 				t.Errorf("%s: Content-Type = %q, want %q", desc, got, want)
