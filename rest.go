@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	pathpkg "path"
 )
@@ -21,6 +22,8 @@ type Object struct {
 	root   reflect.Value
 	parent *Object
 	child  map[string]*Object
+
+	rw sync.RWMutex
 }
 
 func NewObject(obj interface{}) *Object {
@@ -100,44 +103,74 @@ func Handle(path string, obj *Object) {
 	http.Handle(path+"/", http.StripPrefix(path, obj))
 }
 
-func (obj *Object) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	pieces := strings.Split(r.URL.Path, "/")
-	for i := 1; i < len(pieces); i++ {
-		name := pieces[i]
-		if name == "" && i == len(pieces)-1 {
-			continue
-		}
-		sub, ok := obj.child[name]
-		if !ok {
-			w.Header().Set("Content-Type", "text/plain;charset=utf-8")
-			w.WriteHeader(http.StatusNotFound)
-			keys := make([]string, 0, len(obj.child))
-			for key := range obj.child {
-				keys = append(keys, pathpkg.Join(obj.path, key))
-			}
-			sort.Strings(keys)
-			for _, key := range keys {
-				fmt.Fprintln(w, key)
-			}
-			return
-		}
-		obj = sub
+func (obj *Object) find(pieces []string) (*Object, bool) {
+	// If there are no pieces left, we're done
+	if len(pieces) == 0 {
+		return obj, true
 	}
+
+	// If there is a // in the path or a / at the end, ignore it
+	if pieces[0] == "" {
+		return obj.find(pieces[1:])
+	}
+
+	// Find a child if we have one
+	obj.rw.RLock()
+	ret, ok := obj.child[pieces[0]]
+	obj.rw.RUnlock()
+	if !ok {
+		return obj, false
+	}
+
+	return ret.find(pieces[1:])
+}
+
+func (obj *Object) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	pieces := strings.Split(r.URL.Path, "/")[1:]
+	actual, found := obj.find(pieces)
+	if !found {
+		obj.rw.RLock()
+		defer obj.rw.RUnlock()
+		w.Header().Set("Content-Type", "text/plain;charset=utf-8")
+		w.WriteHeader(http.StatusNotFound)
+		keys := make([]string, 0, len(obj.child))
+		for key := range actual.child {
+			keys = append(keys, pathpkg.Join(actual.path, key))
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			fmt.Fprintln(w, key)
+		}
+		return
+	}
+	obj = actual
 
 	var f func(io.Writer, http.Header, *http.Request) (int, error)
 	switch r.Method {
 	case "GET":
 		f = obj.Get
+		obj.rw.RLock()
+		defer obj.rw.RUnlock()
 	case "POST":
 		f = obj.Post
+		obj.rw.Lock()
+		defer obj.rw.Unlock()
 	case "PUT":
 		f = obj.Put
+		obj.rw.Lock()
+		defer obj.rw.Unlock()
 	case "DELETE":
 		f = obj.Delete
+		obj.rw.Lock()
+		defer obj.rw.Unlock()
 	case "PATCH":
 		f = obj.Patch
+		obj.rw.Lock()
+		defer obj.rw.Unlock()
 	case "HEAD":
 		f = obj.Head
+		obj.rw.RLock()
+		defer obj.rw.RUnlock()
 	default:
 		w.Header().Set("Allow", "GET, POST, PUT, DELETE, PATCH, HEAD")
 		http.Error(w, r.Method+" not allowed", http.StatusMethodNotAllowed)
