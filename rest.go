@@ -1,3 +1,17 @@
+// Copyright 2013 Google Inc. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package rest implements the REST model for Representational State Transfer.
 package rest
 
@@ -16,6 +30,12 @@ import (
 	pathpkg "path"
 
 	"kylelemons.net/go/esource"
+)
+
+// Standard Content-Type values
+const (
+	ApplicationJSON = "application/json;charset=utf-8"
+	PlainText       = "text/plain;charset=utf-8"
 )
 
 type Object struct {
@@ -144,6 +164,19 @@ func (obj *Object) set(v reflect.Value) error {
 	return nil
 }
 
+func (obj *Object) del() error {
+	parent := obj.parent
+	if parent == nil {
+		return fmt.Errorf("cannot delete object with no parent")
+	}
+
+	switch parent.kind {
+	default:
+		return fmt.Errorf("cannot delete children of a %s", parent.kind)
+	}
+	return nil
+}
+
 func Handle(path string, obj *Object) {
 	path = pathpkg.Clean(path)
 	http.Handle(path+"/", http.StripPrefix(path, obj))
@@ -177,7 +210,7 @@ func (obj *Object) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !found {
 		obj.rw.RLock()
 		defer obj.rw.RUnlock()
-		w.Header().Set("Content-Type", "text/plain;charset=utf-8")
+		w.Header().Set("Content-Type", PlainText)
 		w.WriteHeader(http.StatusNotFound)
 		keys := make([]string, 0, len(obj.child))
 		for key := range actual.child {
@@ -239,14 +272,21 @@ func (obj *Object) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func encodeJSON(w io.Writer, headers http.Header, v reflect.Value) (code int, err error) {
-	const ContentType = "application/json;charset=utf-8"
 	defer func() {
 		if r := recover(); r != nil {
 			code, err = http.StatusInternalServerError, fmt.Errorf("encode %s: %v", v.Type().Name, r)
 		}
 	}()
-	headers.Set("Content-Type", ContentType)
+	headers.Set("Content-Type", ApplicationJSON)
 	return http.StatusOK, json.NewEncoder(w).Encode(v.Interface())
+}
+
+func decodeJSON(r io.Reader, typ reflect.Type) (vptr reflect.Value, err error) {
+	zptr := reflect.New(typ)
+	if err := json.NewDecoder(r).Decode(zptr.Interface()); err != nil {
+		return reflect.Value{}, fmt.Errorf("failed to decode body as JSON: %s", err)
+	}
+	return zptr.Elem(), nil
 }
 
 func (obj *Object) Get(w io.Writer, headers http.Header, r *http.Request) (int, error) {
@@ -254,11 +294,11 @@ func (obj *Object) Get(w io.Writer, headers http.Header, r *http.Request) (int, 
 }
 
 func (obj *Object) Post(w io.Writer, headers http.Header, r *http.Request) (int, error) {
-	zptr := reflect.New(obj.typ)
-	if err := json.NewDecoder(r.Body).Decode(zptr.Interface()); err != nil {
-		return http.StatusBadRequest, fmt.Errorf("failed to decode body as JSON: %s", err)
+	v, err := decodeJSON(r.Body, obj.typ)
+	if err != nil {
+		return http.StatusBadRequest, err
 	}
-	if err := obj.set(zptr.Elem()); err != nil {
+	if err := obj.set(v); err != nil {
 		return http.StatusBadRequest, err
 	}
 	obj.ESource.Events <- esource.Event{
@@ -269,11 +309,50 @@ func (obj *Object) Post(w io.Writer, headers http.Header, r *http.Request) (int,
 }
 
 func (obj *Object) Put(w io.Writer, headers http.Header, r *http.Request) (int, error) {
-	return http.StatusNotImplemented, nil
+	root := obj.root
+	for {
+		k := root.Kind()
+		// TODO(kevlar) this probably doesn't actually with pointers... should it?
+		if k != reflect.Ptr && k != reflect.Interface {
+			break
+		}
+		if root.IsNil() {
+			break
+		}
+		root = root.Elem()
+	}
+	k, t := root.Kind(), root.Type()
+
+	if k != reflect.Slice {
+		return http.StatusBadRequest, fmt.Errorf("cannot PUT object in non-slice type %s", t)
+	}
+	v, err := decodeJSON(r.Body, t.Elem())
+	if err != nil {
+		return http.StatusBadRequest, err
+	}
+	path := pathpkg.Join(obj.path, strconv.Itoa(root.Len()))
+	root = reflect.Append(root, v)
+	if err := obj.set(root); err != nil {
+		return http.StatusBadRequest, err
+	}
+	obj.ESource.Events <- esource.Event{
+		Type: "put",
+		Data: path,
+	}
+	headers.Set("Content-Type", PlainText)
+	fmt.Fprintln(w, path)
+	return http.StatusCreated, nil
 }
 
 func (obj *Object) Delete(w io.Writer, headers http.Header, r *http.Request) (int, error) {
-	return http.StatusNotImplemented, nil
+	if err := obj.del(); err != nil {
+		return http.StatusBadRequest, err
+	}
+	obj.ESource.Events <- esource.Event{
+		Type: "delete",
+		Data: obj.path,
+	}
+	return http.StatusNoContent, nil
 }
 
 func (obj *Object) Patch(w io.Writer, headers http.Header, r *http.Request) (int, error) {
